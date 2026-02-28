@@ -1,193 +1,168 @@
+"""
+Serial communication handler for ESP32 ECG acquisition.
+Handles:
+    - Binary packet decoding
+    - Signal processing pipeline
+    - Automatic / Manual derivation switching
+"""
+
 import serial
 import time
 import threading
 from collections import deque
+#import serial
+#print(serial)
+#print(serial.__file__)
+#print(dir(serial))
 from . import config
 
-PACEMAKER_TRIGGER_SIGNAL = b'\x02'  # Byte enviado si se detecta falla de latido
 
-class SerialReader:
-    def __init__(self, app_state, ecg_filters):
+class SerialReader(threading.Thread):
+    
+    def __init__(self, app_state):
+        super().__init__(daemon=True)
         self.app_state = app_state
-        self.ecg_filters = ecg_filters
-        self.ser = None
-        self.arduino_ser = None
-        self.running = False
-        self.sync_buffer = bytearray()
         
-        self.realtime_peak_buffer = deque(maxlen=config.R_DISTANCE_DEFAULT * 2)
-        self.last_peak_sample_count = 0
-        self.last_r_time = time.time()  # Tiempo del último pico R detectado
-
-    def connect(self):
-        try:
-            if self.ser: self.ser.close()
-            self.ser = serial.Serial(config.SERIAL_PORT, config.BAUD_RATE, timeout=0.1)
-            time.sleep(2)
-            self.ser.flushInput()
-            self.ser.flushOutput()
-            print("ESP32 data port connected.")
-            return True
-        except Exception as e:
-            print(f"Error connecting to ESP32 data port: {e}")
-            return False
-
-    def connect_arduino(self):
-        try:
-            if self.arduino_ser and self.arduino_ser.is_open:
-                self.arduino_ser.close()
-            self.arduino_ser = serial.Serial(config.TRIGGER_SERIAL_PORT, config.TRIGGER_BAUD_RATE, timeout=0.1)
-            print(f"Arduino control port {config.TRIGGER_SERIAL_PORT} connected.")
-            return True
-        except Exception as e:
-            print(f"Error connecting Arduino control port {config.TRIGGER_SERIAL_PORT}: {e}")
-            return False
-    
-    def decode_packet(self, pkt):
-        if len(pkt) != 4 or pkt[0] != 0xAA:
-            return None
-        start, lsb, msb, checksum = pkt
-        expected_checksum = start ^ lsb ^ msb
-        if checksum != expected_checksum:
-            return None
-        val = (msb << 8) | lsb
-        voltage = val * (3.3 / 4095)
-        return voltage
-
-    def check_for_r_peak_and_trigger(self, new_sample):
-        self.realtime_peak_buffer.append(new_sample)
-        if len(self.realtime_peak_buffer) < 3:
-            return
-
-        mid_idx = len(self.realtime_peak_buffer) - 2
-        p_before, p_peak, p_after = self.realtime_peak_buffer[mid_idx-1], self.realtime_peak_buffer[mid_idx], self.realtime_peak_buffer[mid_idx+1]
-
-        threshold = self.app_state.r_threshold.get()
-        distance = self.app_state.r_distance.get()
-
-        if p_peak > threshold and p_peak > p_before and p_peak > p_after:
-            if (self.app_state.sample_count - self.last_peak_sample_count) >= distance:
-                if self.arduino_ser and self.arduino_ser.is_open:
-                    try:
-                        self.arduino_ser.write(config.TRIGGER_SIGNAL)  # Trigger normal
-                    except Exception as e:
-                        print(f"Error writing R-peak trigger to Arduino: {e}")
-                        self.app_state.arduino_connected = False
-                self.last_peak_sample_count = self.app_state.sample_count
-                self.last_r_time = time.time()  # Actualizamos tiempo del último pico R
-
-    def read_data(self):
-        print("Starting data acquisition thread...")
-        while self.running:
-            try:
-                # Conectar ESP32
-                if not self.ser or not self.ser.is_open:
-                    self.app_state.serial_connected = False
-                    if not self.connect():
-                        time.sleep(1)
-                        continue
-                self.app_state.serial_connected = True
-
-                # Conectar Arduino
-                if not self.arduino_ser or not self.arduino_ser.is_open:
-                    self.app_state.arduino_connected = self.connect_arduino()
-                else:
-                    self.app_state.arduino_connected = True
-                
-                # Leer datos ESP32
-                if self.ser.in_waiting > 0:
-                    raw_bytes = self.ser.read(self.ser.in_waiting)
-                    self.process_raw_bytes(raw_bytes)
-
-                # Revisar marcapasos
-                self.check_pacemaker()
-                time.sleep(0.005)
-            except Exception as e:
-                print(f"Error in serial reading loop: {e}")
-                self.app_state.serial_connected = False
-                self.app_state.arduino_connected = False
-                time.sleep(1)
-
-    def process_raw_bytes(self, raw_bytes):
-        self.sync_buffer.extend(raw_bytes)
-        
-        while len(self.sync_buffer) >= 4:
-            start_idx = self.sync_buffer.find(b'\xaa')
-            if start_idx == -1:
-                self.sync_buffer.clear()
-                break
-            if start_idx > 0:
-                del self.sync_buffer[:start_idx]
-            if len(self.sync_buffer) >= 4:
-                packet = self.sync_buffer[:4]
-                voltage = self.decode_packet(packet)
-                if voltage is not None:
-                    voltage *= self.app_state.ecg_gain.get()
-                    filtered_voltage = self.ecg_filters.process_sample(voltage)
-                    final_filtered_voltage = filtered_voltage + self.app_state.voltage_offset.get()
-                    self.check_for_r_peak_and_trigger(final_filtered_voltage)
-                    with self.app_state.data_lock:
-                        self.app_state.voltage_buffer.append(voltage)
-                        self.app_state.filtered_buffer.append(final_filtered_voltage)
-                        self.app_state.time_buffer.append(self.app_state.sample_count)
-                        self.app_state.sample_count += 1
-                del self.sync_buffer[:4]
-            else:
-                break
-
-    def check_pacemaker(self):
-        """Dispara alerta si no hay pico R en tiempo definido"""
-        interval = time.time() - self.last_r_time
-        if interval > 2.0:  # 2 segundos sin latido
-            if self.arduino_ser and self.arduino_ser.is_open:
-                try:
-                    self.arduino_ser.write(PACEMAKER_TRIGGER_SIGNAL)
-                except Exception as e:
-                    print(f"Error sending pacemaker trigger: {e}")
-                    self.app_state.arduino_connected = False
-
-    def start(self):
+        self.serial_port = None
+        #serial.Serial(config.SERIAL_PORT, config.BAUDRATE)
         self.running = True
-        self.thread = threading.Thread(target=self.read_data, daemon=True)
-        self.thread.start()
+        
+        #self.read_thread = None
+        #self.auto_thread = None
     
+    def run(self):
+        while self.running:
+            if self.serial_port and self.serial_port.in_waiting:
+                line = self.serial_port.readline().decode().strip()
+                self.app_state.add_sample(line)
+
+    def send_mux_command(self, state):
+        command = f"STATE_{state}\n"
+        self.serial_port.write(command.encode())
+
     def stop(self):
         self.running = False
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            print("ESP32 data port closed.")
-        if self.arduino_ser and self.arduino_ser.is_open:
-            self.arduino_ser.close()
-            print("Arduino control port closed.")
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
 
-    def send_command(self, command):
-        if not self.arduino_ser or not self.arduino_ser.is_open:
-            print("Error: Arduino not connected. Cannot send command.")
-            return
+    # =========================================================
+    # ----------------- CONNECTION ----------------------------
+    # =========================================================
+    
+    def connect(self):
+        try:
+            self.serial_port = serial.Serial(
+                port=config.SERIAL_PORT,
+                baudrate=config.BAUDRATE,
+                timeout=config.SERIAL_TIMEOUT
+            )
+            
+            self.app_state.serial_connected = True
+            self.app_state.esp32_connected = True
+            
+            self.running = True
+            
+            # Thread lectura ECG
+            self.read_thread = threading.Thread(
+                target=self.read_serial,
+                daemon=True
+            )
+            self.read_thread.start()
+            
+            # Thread modo automático
+            self.auto_thread = threading.Thread(
+                target=self.auto_mode_loop,
+                daemon=True
+            )
+            self.auto_thread.start()
+            
+            print("ESP32 connected successfully")
+            
+        except Exception as e:
+            print("Connection error:", e)
+            self.app_state.serial_connected = False
+            self.app_state.esp32_connected = False
 
-        cmd_map = {
-            "STATE_0": '0',
-            "STATE_1": '1',
-            "STATE_2": '2',
-            "STATE_3": '3',
-            "START":   'S',
-            "STOP":    'X',
-        }
+    # =========================================================
+    # ----------------- DISCONNECT ----------------------------
+    # =========================================================
+    
+    def disconnect(self):
+        self.running = False
         
-        char_to_send = cmd_map.get(command)
-        if not char_to_send:
-            print(f"Warning: Unknown command '{command}'")
-            return
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
+        
+        self.app_state.serial_connected = False
+        self.app_state.esp32_connected = False
+        
+        print("Disconnected")
 
-        with self.app_state.mux_control_lock:
+    # =========================================================
+    # ----------------- READ ECG DATA -------------------------
+    # =========================================================
+    
+    def read_serial(self):
+        """
+        Reads ECG values from ESP32.
+        Expected format: one value per line (e.g., 1.234)
+        """
+        while self.running:
             try:
-                self.arduino_ser.write(char_to_send.encode('utf-8'))
-                print(f"Command '{char_to_send}' sent to Arduino.")
-                if command.startswith("STATE_"):
-                    self.app_state.current_mux_state = int(command[-1])
-                elif command == "START":
-                    self.app_state.current_mux_state = -1
-                elif command == "STOP":
-                    self.app_state.current_mux_state = -2
-            except Exception as e:
-                print(f"Error sending command to Arduino: {e}")
+                if self.serial_port.in_waiting:
+                    line = self.serial_port.readline().decode().strip()
+                    
+                    if line:
+                        voltage = float(line)
+                        
+                        with self.app_state.data_lock:
+                            self.app_state.voltage_buffer.append(voltage)
+                            self.app_state.sample_count += 1
+                            
+            except:
+                continue
+
+    # =========================================================
+    # ----------------- SEND MUX COMMAND ----------------------
+    # =========================================================
+    
+    def send_mux_command(self, state):
+        """
+        Sends derivation index (0–5) to ESP32.
+        ESP32 must decode and control CD4051.
+        """
+        if self.serial_port and self.serial_port.is_open:
+            command = f"STATE{state}\n"
+            self.serial_port.write(command.encode())
+
+    # =========================================================
+    # ----------------- AUTO MODE LOOP ------------------------
+    # =========================================================
+    
+    def auto_mode_loop(self):
+        """
+        Handles automatic derivation switching.
+        """
+        last_switch_time = time.time()
+        
+        while self.running:
+            
+            # Verificar si debe entrar en modo AUTO
+            self.app_state.check_auto_mode()
+            
+            if self.app_state.operation_mode.get() == "AUTO":
+                
+                if time.time() - last_switch_time >= config.AUTO_SWITCH_INTERVAL:
+                    
+                    # Cambiar derivación
+                    self.app_state.next_derivation()
+                    
+                    # Enviar comando al ESP32
+                    self.send_mux_command(
+                        self.app_state.current_mux_state
+                    )
+                    
+                    last_switch_time = time.time()
+            
+            time.sleep(0.1)
+            
